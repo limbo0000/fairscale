@@ -444,7 +444,7 @@ def test_collect_shards():
     )
 
 
-def run_test_reproducibility(rank, world_size, reference_rank, tempfile_name):
+def run_test_reproducibility(rank, world_size, reference_rank, tempfile_name, broadcast_fp16):
     dist_init(rank, world_size, tempfile_name)
     device = torch.device(rank) if torch.cuda.device_count() > 1 else DEVICE
 
@@ -459,7 +459,7 @@ def run_test_reproducibility(rank, world_size, reference_rank, tempfile_name):
     loss_fn = torch.nn.L1Loss()
     loss_fn.to(device)
 
-    optimizer = optim.OSS(model.parameters(), optim=torch.optim.RMSprop, lr=0.1)
+    optimizer = optim.OSS(model.parameters(), optim=torch.optim.RMSprop, lr=0.1, broadcast_fp16=broadcast_fp16)
 
     def closure():
         optimizer.zero_grad()
@@ -495,7 +495,8 @@ def run_test_reproducibility(rank, world_size, reference_rank, tempfile_name):
     dist.destroy_process_group()
 
 
-def test_reproducibility():
+@pytest.mark.parametrize("broadcast_fp16", [True, False])
+def test_reproducibility(broadcast_fp16):
     world_size = 2
     temp_file_name = tempfile.mkstemp()[1]
 
@@ -506,7 +507,7 @@ def test_reproducibility():
     reference_rank = 0
 
     mp.spawn(
-        run_test_collect_shards, args=(world_size, reference_rank, temp_file_name), nprocs=world_size, join=True,
+        run_test_collect_shards, args=(world_size, reference_rank, temp_file_name, broadcast_fp16), nprocs=world_size, join=True,
     )
 
 

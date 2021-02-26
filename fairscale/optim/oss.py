@@ -52,7 +52,8 @@ class OSS(Optimizer):
             torch.distributed group (default: group.WORLD)
         broadcast_buffer_size (int):
             (deprecated) used to cap the size of the broadcast buffers, not being used anymore.
-
+        fp16_broadcast (bool):
+            compress the model shards to fp16 when exchanging in between ranks (default: False)
 
     .. warning: the communication patterns that OSS use depend on the "trainability" graph,
         meaning that all the parameters which `require_grad` are handled differently. This is
@@ -73,6 +74,7 @@ class OSS(Optimizer):
         optim: Type[Optimizer] = SGD,
         group: Optional[Any] = None,
         broadcast_buffer_size: int = -1,
+        broadcast_fp16: bool = False,
         **default: Any,
     ):
 
@@ -80,6 +82,7 @@ class OSS(Optimizer):
         self.in_super_constructor = True
         super().__init__(params, default)
         self.in_super_constructor = False
+        self._broadcast_fp16 = broadcast_fp16
 
         # Partition information. lazy evaluation, computed when requested
         self._per_device_params: Dict[torch.device, List[List[Parameter]]] = OrderedDict()  # device, rank, params
@@ -541,19 +544,49 @@ class OSS(Optimizer):
     def _broadcast_params(self) -> None:
         """Helper function to broadcast all the parameters from a given device"""
 
-        last_work_handle = None  # Work handles are consumed within this scope, no callback
+        if self._broadcast_fp16:
+            # Make a fp16 copy of the shard, broadcast, copy back
+            work_handles = []
 
-        for device in self.buckets.keys():
-            for src_rank, bucket in enumerate(self.buckets[device]):
-                if bucket.numel() > 0:
-                    global_src_rank = self.get_global_rank(self.group, src_rank)
-                    last_work_handle = dist.broadcast(
-                        tensor=bucket, src=global_src_rank, group=self.group, async_op=True
-                    )
+            for device in self.buckets.keys():
+                for src_rank, bucket in enumerate(self.buckets[device]):
+                    if bucket.numel() > 0:
+                        global_src_rank = self.get_global_rank(self.group, src_rank)
+                        param_dtype = bucket.dtype
+                        broadcast_data = bucket.data.half()
 
-        # Only check on the last handle, they're all inlined on the same CUDA stream
-        if last_work_handle:
-            last_work_handle.wait()
+                        def decompress() -> None:
+                            bucket.data = broadcast_data.to(dtype=param_dtype)
+
+                        work_handles.append(
+                            (
+                                dist.broadcast(
+                                    tensor=broadcast_data, src=global_src_rank, group=self.group, async_op=True
+                                ),
+                                decompress,
+                                broadcast_data,
+                            )
+                        )
+            # Decompress all the buffers
+            for handle in work_handles:
+                handle[0].wait()
+                handle[1]()
+
+        else:
+            # Directly broadcast the buffers backing the tensor views
+            last_work_handle = None  # Work handles are consumed within this scope, no callback
+
+            for device in self.buckets.keys():
+                for src_rank, bucket in enumerate(self.buckets[device]):
+                    if bucket.numel() > 0:
+                        global_src_rank = self.get_global_rank(self.group, src_rank)
+                        last_work_handle = dist.broadcast(
+                            tensor=bucket, src=global_src_rank, group=self.group, async_op=True
+                        )
+
+            # Only check on the last handle, they're all inlined on the same CUDA stream
+            if last_work_handle:
+                last_work_handle.wait()
 
     def _setup_flat_buffers(self) -> None:
         """Make all params which are on the same device and tied to the same rank views of a single buffer.
@@ -569,28 +602,24 @@ class OSS(Optimizer):
 
             # Make parameters a view of the bucket
             for dst_rank, params in enumerate(per_rank_params):
-                if len(params) > 0:
+                # Clone the non-trainable params, if in a bucket it will get destroyed
+                for param in filter(lambda x: not x.requires_grad, params):
+                    param.data = param.data.detach().clone()
 
-                    # Clone the non-trainable params, if in a bucket it will get destroyed
-                    for param in filter(lambda x: not x.requires_grad, params):
-                        param.data = param.data.detach().clone()
+                # Merge all the trainable params in a single bucket
+                trainable_params = list(filter(lambda x: x.requires_grad, params))
+                buffer_size = sum(map(lambda x: x.numel(), trainable_params))
+                bucket = torch.empty(buffer_size, dtype=params[0].dtype, device=device)
+                offset = 0
 
-                    # Merge all the trainable params in a single bucket
-                    trainable_params = list(filter(lambda x: x.requires_grad, params))
-                    buffer_size = sum(map(lambda x: x.numel(), trainable_params))
-                    bucket = torch.empty(buffer_size, dtype=params[0].dtype, device=device)
-                    offset = 0
+                for param in trainable_params:
+                    offset_next = offset + param.numel()
+                    bucket[offset:offset_next].copy_(param.data.flatten())
+                    param.data = bucket[offset:offset_next].view_as(param.data)
+                    offset = offset_next
 
-                    for param in trainable_params:
-                        offset_next = offset + param.numel()
-                        bucket[offset:offset_next].copy_(param.data.flatten())
-                        param.data = bucket[offset:offset_next].view_as(param.data)
-                        offset = offset_next
-
-                    # Either replace the existing bucket, or create it
-                    if len(self.buckets[device]) == dst_rank:
-                        self.buckets[device].append(bucket)
-                    else:
-                        self.buckets[device][dst_rank] = bucket
+                # Either replace the existing bucket, or create it
+                if len(self.buckets[device]) == dst_rank:
+                    self.buckets[device].append(bucket)
                 else:
                     self.buckets[device].append(torch.zeros(0, device=device))

@@ -384,7 +384,7 @@ class OSS(Optimizer):
         """
 
         # NOTE: PyTorch 1.5 does not index linearly but with the id(params) at saving time
-        # we work around that here by using the fact that the params are ordered as in the param_groups
+        # we work around that here by using tracking the ordering with respect to the param group
         id_map = {
             old_id: p
             for old_id, p in zip(
@@ -392,6 +392,8 @@ class OSS(Optimizer):
                 chain(*(g["params"] for g in self.param_groups)),
             )
         }
+
+        print(id_map.keys())
 
         for key, value in state_dict["state"].items():
             param = id_map[key]

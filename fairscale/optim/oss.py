@@ -85,7 +85,6 @@ class OSS(Optimizer):
         self._per_device_params: Dict[torch.device, List[List[Parameter]]] = OrderedDict()  # device, rank, params
         self._param_rank: Dict[torch.Tensor, int] = {}
         self._partition_parameters: List[List[dict]] = []
-        self._index_to_param: Dict[int, torch.Tensor] = {}
         self._param_to_index: Dict[int, int] = {}
         self._local_params: Optional[List[torch.Tensor]] = None
 
@@ -97,8 +96,9 @@ class OSS(Optimizer):
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.global_rank = self.get_global_rank(self.group, self.rank)
-        self.buckets: Dict[torch.device, List[torch.Tensor]] = {}
+        self._local_to_global_rank = [self.get_global_rank(self.group, i) for i in range(self.world_size)]
 
+        self.buckets: Dict[torch.device, List[torch.Tensor]] = {}
         self._all_states: List[Dict[str, Any]] = []  # Optional consolidated optimizer state
         self._default_device = torch.device("cpu")
 
@@ -165,15 +165,6 @@ class OSS(Optimizer):
 
         # Make sure that the iterator is not consumed, only expose a copy
         return self._local_params
-
-    @property
-    def index_to_param(self) -> Dict[int, torch.Tensor]:
-        """ Hash table in between parameter indices in the global optimizer scheme, and the actual params
-        """
-        if len(self._index_to_param) == 0:
-            self._index_to_param = {i: p for i, p in enumerate(chain(*(g["params"] for g in self.param_groups)))}
-
-        return self._index_to_param
 
     @property
     def param_to_index(self) -> Dict[int, int]:
@@ -382,8 +373,6 @@ class OSS(Optimizer):
                         global_id = self.param_to_index[local_index_to_param_id[local_param_index]]
                         state_dict["state"][global_id] = s["state"][local_param_index]
 
-        # Make sure that the parameters are sorted in the state, as expected
-        state_dict["state"] = dict(sorted(state_dict["state"].items()))
         return state_dict
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
@@ -396,10 +385,16 @@ class OSS(Optimizer):
 
         # NOTE: PyTorch 1.5 does not index linearly but with the id(params) at saving time
         # we work around that here by using the fact that the params are ordered as in the param_groups
-        pytorch15_index_redirect = {k: i for i, k in enumerate(state_dict["state"].keys())}
+        id_map = {
+            old_id: p
+            for old_id, p in zip(
+                chain(*(g["params"] for g in state_dict["param_groups"])),
+                chain(*(g["params"] for g in self.param_groups)),
+            )
+        }
 
         for key, value in state_dict["state"].items():
-            param = self.index_to_param[pytorch15_index_redirect[key]]
+            param = id_map[key]
 
             # Populate the sharded optimizer state on the fly
             if self.param_to_rank[param] != self.rank:
@@ -447,12 +442,10 @@ class OSS(Optimizer):
                     dist_device=self._default_device,
                 )
             else:
-                global_rank = self.get_global_rank(self.group, rank)
-
                 # Discard this tensor/rank, broadcast necessary for syncing and because NCCL does not support gather
                 broadcast_object(
                     torch.tensor([dummy_sync_tensor], dtype=torch.uint8, device=self._default_device),
-                    src_rank=global_rank,
+                    src_rank=self._local_to_global_rank[rank],
                     group=self.group,
                     dist_device=self._default_device,
                 )
@@ -477,10 +470,9 @@ class OSS(Optimizer):
                 )
             else:
                 # Fetch the optim state from the other replicas
-                global_rank = self.get_global_rank(self.group, rank)
                 replica_state = broadcast_object(
                     torch.tensor([0], dtype=torch.uint8, device=self._default_device),
-                    src_rank=global_rank,
+                    src_rank=self._local_to_global_rank[rank],
                     group=self.group,
                     dist_device=self._default_device,
                 )
@@ -523,7 +515,6 @@ class OSS(Optimizer):
         self._partition_parameters.clear()
         self._per_device_params.clear()
         self._param_rank.clear()
-        self._index_to_param.clear()
         self._param_to_index.clear()
         self._local_params = None
 
@@ -552,8 +543,9 @@ class OSS(Optimizer):
 
         for device in self.buckets.keys():
             for src_rank, bucket in enumerate(self.buckets[device]):
-                global_src_rank = self.get_global_rank(self.group, src_rank)
-                last_work_handle = dist.broadcast(tensor=bucket, src=global_src_rank, group=self.group, async_op=True)
+                last_work_handle = dist.broadcast(
+                    tensor=bucket, src=self._local_to_global_rank[src_rank], group=self.group, async_op=True
+                )
 
         # Only check on the last handle, they're all inlined on the same CUDA stream
         if last_work_handle:

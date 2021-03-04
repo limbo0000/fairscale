@@ -800,8 +800,8 @@ def run_ddp_parity(rank, world_size, backend, temp_file_name):
         # Define a model to be trained by OSS
         oss_module = torch.nn.Sequential(trunk, head)
         oss_trainable_params = [
-            {"params": trunk.parameters(), "lr": 1e-5},
-            {"params": head.parameters(), "lr": 1e-4},
+            {"params": list(trunk.parameters())[:-1] + list(head.parameters()), "lr": 1e-5},
+            {"params": list(trunk.parameters())[-1], "lr": 1e-4},
         ]
 
         optimizer_settings: Dict[Any, Any] = {}
@@ -824,8 +824,8 @@ def run_ddp_parity(rank, world_size, backend, temp_file_name):
         ddp_module = torch.nn.Sequential(ddp_trunk, ddp_head)
 
         ddp_trainable_params = [
-            {"params": ddp_trunk.parameters(), "lr": 1e-5},
-            {"params": ddp_head.parameters(), "lr": 1e-4},
+            {"params": list(ddp_trunk.parameters())[:-1] + list(ddp_head.parameters()), "lr": 1e-5},
+            {"params": list(ddp_trunk.parameters())[-1], "lr": 1e-4},
         ]
         ddp_optimizer = optimizer(ddp_trainable_params, **optimizer_settings)  # type: ignore
         ddp_model = DDP(module=ddp_module, device_ids=[rank], broadcast_buffers=True, find_unused_parameters=True)

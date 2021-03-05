@@ -12,6 +12,9 @@ import warnings
 import setuptools
 import torch
 from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
+import site
+site.ENABLE_USER_SITE = True
+
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
